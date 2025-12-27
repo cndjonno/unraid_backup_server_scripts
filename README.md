@@ -1,36 +1,105 @@
-# backup_server_scripts
+# Unraid Backup & Failover Server Scripts
 
-These scripts are made to be run on 2 Unraid servers. One on the source server the other two on the backup server.
-Their purpose is to automatically backup selected data and/or appdata from a source server to a backup server. The backup server will be automatically powered on and started from the script running on the source server.
-Once the backup server has started it will sync the user selected shares/folders from the source server to the backup server.
+**Automated backup, sync, and failover solution for two Unraid servers.**
 
-Once the sync has been completed various actions can be done.
+This repository contains a set of Bash scripts designed to be used with the **Unraid User Scripts Plugin**. They automate the process of waking up a backup server, syncing data and appdata from a main (source) server, and optionally spinning up containers on the backup server to act as a failover.
 
-1. Backup only. -- The backup server can be automatically shut down after the sync has completed. This is useful if you want to have a backup server only running when needed for the backup job. This saves both electricity and wear and tear on the backup server's hard disks.
+## 🌟 Features
 
-2. Switch server. -- The source server can be shutdown after the sync has completed leaving only the backup server running.
-Both data and container appdata (from selected containers) is synced from the source server to the backup server. Then selected containers are started on the backup server taking over the duties of the (now shutdown) source server. This is useful for 2 media servers for example running Emby. For example the media can be synced from the source to the backup server. Also the Emby appdata or database can be synced from source server to backup server. Then the synced Emby container is automatically started on the Backup server. So all watch history ect is transfered from one server to the other.
+* **Auto-Wake Backup Server**: Automatically powers on the destination server using Wake-on-LAN (WOL) before starting the backup.
+* **Data & Appdata Sync**: Uses `rsync` to synchronize selected shares and Docker appdata folders.
+* **Failover Capability ("Switch Server")**: Can shut down the source server and automatically start specific Docker containers on the backup server (e.g., Plex/Emby/Jellyfin), preserving watch history and metadata.
+* **Failback Capability ("Switch Back")**: Automates syncing data back to the main server and restoring the original state.
+* **Power Management**: Options to shut down the backup server after syncing to save electricity and hardware lifespan.
 
-3. Switch server back. The source server can be automatically started at a later time. Then the appdata and/or main data synced back to the source server. The backup server is then shutdown and the containers (used in '2. switch server') are started back up on the source server. So again with a media server running for example emby, the watch history etc is synced back to the main server.
+---
 
-These scripts should be run using Unraid's User Scripts plugin. 
+## 📋 Prerequisites
 
-There are 3 scripts
-1. source server backup script.sh  - This is the only script used on the source server. All variables are set in this script for both source and backup server.
-   This script is creates a config file that is used by all 3 scripts so to make configuration easier. This script can be set to run on a cron schedule. When run 
-   it is this script which will start the backup/destination server automatically then run the backup as selected in the variables in this script.
+1.  **Two Unraid Servers**: A "Source" (Main) server and a "Destination" (Backup) server.
+2.  **User Scripts Plugin**: Installed on both servers (available via Community Applications).
+3.  **SSH Key Authentication**: The destination server **must** be able to SSH into the source server without a password. [See instructions below](#-ssh-key-setup-required).
+4.  **Wake-on-LAN (WOL)**: The destination server must have WOL enabled in its BIOS and Unraid network settings if you want it to auto-boot.
 
-2. destination server backup script.sh  - This script is run on the destination server. Being set to autorun on the start of the destination/backup server. 
-   However it will only execute if the destination server has been started by the script on the source server. If the backup/destination server had been manually
-   powered on / started then the script will not run. When the script executes it will sync the data and or appdata that was set in the variables in the source 
-   server script.  - only one variable needs setting in this script -- that is to specify the source servers ip address.
-   
-3. start source server - destination server script.  - This script is also run on the destination server. This script has no variables that need to be set.
-   This script should be set to run at the time you want the source server to be autostarted. It will then do this and sync the data and or appdata back to the
-   source server.
-   
-   For these scripts to work you must create ssh keys on the destination server and import them to the source server so the destination server can make an
-   ssh connection to the source server.
-   
-   A video will be released very soon showing in detail how to configure and use these scripts. A link will be put here soon.
-   
+---
+
+## 📂 Script Overview & Installation
+
+There are 3 scripts in this suite. You will need to create a new script entry in the **User Scripts Plugin** for each one and paste the contents of the `.sh` files from this repo.
+
+### 1. Source Server Backup Script (`source server backup script.sh`)
+* **Location**: Run on the **Source (Main)** server.
+* **Function**: This is the "Master" script. It handles the logic for waking the backup server, creating the config file, and initiating the sync.
+* **Configuration**:
+    * **All primary variables are set here.**
+    * Edit the variables at the top of the file to define:
+        * IP addresses (Source & Destination).
+        * MAC address of the Destination (for WOL).
+        * List of Shares to backup.
+        * List of Docker Containers to backup/failover.
+* **Schedule**: Set this to run on a custom Cron schedule (e.g., nightly at 3 AM).
+
+### 2. Destination Server Backup Script (`destination server backup script.sh`)
+* **Location**: Run on the **Destination (Backup)** server.
+* **Function**: Performs the actual `rsync` pull command.
+* **Configuration**:
+    * **Only one variable needs editing**: `source_server_ip` (Set this to your Main server's IP).
+* **Schedule**: Set to **"At Startup of Array"**.
+    * *Note: It checks a flag file created by the source script. If the server was turned on manually, this script will exit without doing anything.*
+
+### 3. Start Source Server Script (`start source server - destination server script.sh`)
+* **Location**: Run on the **Destination (Backup)** server.
+* **Function**: Used for the **"Switch Back"** scenario. It wakes the main server and syncs the latest data back to it.
+* **Configuration**: No variables need to be set (it uses the config generated by the main script).
+* **Schedule**: Set manually or scheduled only when you are ready to revert to the main server.
+
+---
+
+## 🔑 SSH Key Setup (Required)
+
+For the scripts to work, the **Destination** server needs to communicate with the **Source** server securely without user intervention.
+
+1.  **Open a Terminal** on the **Destination (Backup)** server.
+2.  **Generate a key pair** (press Enter to accept defaults and **no passphrase**):
+    ```bash
+    ssh-keygen -t rsa -b 4096
+    ```
+3.  **Copy the key to the Source server**:
+    * Replace `root` with your user (usually root on Unraid) and `SOURCE_IP` with the Main server's IP.
+    ```bash
+    ssh-copy-id -i /root/.ssh/id_rsa.pub root@192.168.1.X
+    ```
+4.  **Test the connection**:
+    * From the Destination terminal, type: `ssh root@192.168.1.X`
+    * If you log in without being asked for a password, it works!
+
+---
+
+## 🚀 Usage Modes
+
+Once configured, the system operates based on the settings you choose in the **Source Server Script**.
+
+### Mode 1: Backup Only
+* **Behavior**: Source wakes Backup -> Syncs Data -> Backup shuts down.
+* **Use Case**: Nightly off-site or local backups to save power.
+
+### Mode 2: Switch Server (Failover)
+* **Behavior**: Source wakes Backup -> Syncs Data -> Source shuts down -> Backup starts specific Docker containers.
+* **Use Case**: Moving operations to the backup server during maintenance or scheduled downtime.
+
+### Mode 3: Switch Server Back (Restore)
+* **Behavior**: Run the *Start Source Server* script on the Backup unit.
+* **Action**: Backup wakes Source -> Syncs new data back to Source -> Backup stops containers -> Source starts containers -> Backup shuts down.
+* **Use Case**: Returning to normal operations after a failover event.
+
+---
+
+## ⚠️ Important Notes
+
+* **Network**: Ensure both servers have static IP addresses defined in your router or Unraid network settings.
+* **First Run**: The first backup will take a significant amount of time as it must transfer all data. Subsequent runs will be fast (incremental).
+* **Testing**: ALWAYS test with a test share/folder before automating critical data backups.
+
+## 🤝 Credits
+Original concept and scripts by [SpaceinvaderOne](https://github.com/SpaceinvaderOne).
+Forked and maintained by [cndjonno](https://github.com/cndjonno).
