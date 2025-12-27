@@ -1,56 +1,121 @@
 #!/bin/bash
-# TITLE: backup server script
-# WARNING: needs source server script setup on source server to work
-umask 0000
-############# Basic settings ##########################################################
-source_server_ip="192.168.4.2" # set to the ip of the source server
-forcestart="no"  # default is "no" - set to yes to force process to run even if source server didn't request
-checkandstart="no" # default is "no" - set to yes for script to start below containers if main server is NOT running
-declare -a container_start=("EmbyServerBeta" "swag") # put each container name in quotes ie container_start_stop=("EmbyServerBeta" "swag")
+# -----------------------------------------------------------------------------------------
+# TITLE:        Unraid Backup Server Script (Optimized & Documented)
+# AUTHOR:       System Administrator / Gemini AI
+# DESCRIPTION:  Syncs data/appdata from a Source Unraid server to a Backup Unraid server.
+#               Manages Docker container states (start/stop) to ensure database integrity.
+# PLATFORM:     Unraid (Slackware-based Linux)
+# -----------------------------------------------------------------------------------------
 
-############# Declared Variables ##########################################################
-HOST="root@""$source_server_ip" # dont change
-CONFI="/mnt/user/appdata/backupserver/" # dont change
+# --- SAFETY: Set standard permissions ---
+# umask 0022 results in: Directories 755 (drwxr-xr-x), Files 644 (rw-r--r--)
+# This prevents creating world-writable files (security risk) while allowing readability.
+umask 0022
 
-#############  Functions ##############################################################
+###########################################################################################
+#                                 CONFIGURATION SECTION                                   #
+###########################################################################################
+
+# Network Settings
+source_server_ip="192.168.4.2"
+
+# Automation Flags
+forcestart="no"       # Set to "yes" to run backup even if source didn't request it
+checkandstart="no"    # Set to "yes" to wake up containers if source is dead (failover)
+
+# Container Management
+# List the exact names of Docker containers to manage during backup.
+declare -a container_list=("EmbyServerBeta" "swag") 
+
+# Constants & Paths
+HOST="root@${source_server_ip}"
+CONFIG_DIR="/mnt/user/appdata/backupserver"
+CONFIG_FILE="${CONFIG_DIR}/config.cfg"
+LOCK_FILE="${CONFIG_DIR}/start"
+
+# Unraid Specific Tooling
+# This is the built-in Unraid script for GUI/Email/Discord notifications.
+NOTIFY="/usr/local/emhttp/webGui/scripts/notify"
+
+# Default Variables (Fail-safes)
+# These are initialized here so the script doesn't crash if config.cfg fails to load.
+copymaindata="no"
+copyappdata="no"
+switchserver="no"
+poweroff="no"
+logname="/mnt/user/appdata/backupserver/backup.log"
+
+
+###########################################################################################
+#                                   HELPER FUNCTIONS                                      #
+###########################################################################################
+
+# -----------------------------------------------------------------------------------------
+# Function: send_notification
+# Purpose:  Sends system alerts using Unraid's native notification system.
+#           Alerts appear in the WebUI and any configured agents (Discord, Email, etc.).
+# Inputs:   $1 = Severity (normal, warning, alert)
+#           $2 = Message Content
+# -----------------------------------------------------------------------------------------
+send_notification() {
+    local severity="$1" 
+    local message="$2"
+    
+    # Print to console for manual debugging
+    echo "[${severity^^}] ${message}"
+    
+    # Send to Unraid GUI if the tool exists
+    if [ -x "$NOTIFY" ]; then
+        "$NOTIFY" -e "Backup Script" -s "Backup Event" -d "${message}" -i "${severity}"
+    fi
+}
+
+###########################################################################################
+#                                 CORE SYNC LOGIC                                         #
+###########################################################################################
+
+# -----------------------------------------------------------------------------------------
+# Function: Check_Source_Server
+# Purpose:  1. Verifies connectivity to the source server.
+#           2. Downloads the latest config.cfg from the source.
+#           3. Checks for the existence of the 'start' lock file on the source.
+# Logic:    If server is unreachable and failover is enabled, it starts local containers.
+# -----------------------------------------------------------------------------------------
 Check_Source_Server() {
-    # Check if source server is reachable (Ping 3 times, quiet output)
-    # Using 'if ! ping' is cleaner than checking $?
+    echo "Checking source server status..."
+    
     if ! ping -c3 -q "$source_server_ip" &>/dev/null; then
-        # --- Server is OFF ---
         sourceserverstatus="off"
-        echo "Source server is off."
+        echo "Source server ($source_server_ip) is unreachable."
 
         if [ "$checkandstart" == "yes" ]; then
-            echo "I will start selected containers"
-            startcontainers_if_main_off
+            send_notification "warning" "Source server down. Initiating Failover: Starting containers."
+            startcontainers_failover
         else
-            echo "Exiting"
+            echo "Source is down and Failover is disabled. Exiting."
         fi
-        
-        # Exit script immediately since server is off
         exit 0
     else
-        # --- Server is ON ---
         sourceserverstatus="on"
-        
-        # Prepare config directory
-        mkdir -p "$CONFI"
+        mkdir -p "$CONFIG_DIR"
 
-        # Sync config file. If rsync fails, set start="no"
-        if ! rsync -avhsP "$HOST":"$CONFI" "$CONFI"; then
+        # Attempt to pull the config file
+        if ! rsync -avhsP "$HOST":"$CONFIG_DIR/" "$CONFIG_DIR/"; then
+            echo "Error: Could not sync config file from source."
+            # If we can't get the config, we default to NOT running the heavy syncs
             start="no"
-        fi
-
-        # Source the configuration file if it exists
-        if [ -f "${CONFI}config.cfg" ]; then
-            source "${CONFI}config.cfg"
         else
-            echo "Warning: Config file not found at ${CONFI}config.cfg"
+            # Source the configuration file safely
+            if [ -f "$CONFIG_FILE" ]; then
+                # shellcheck source=/dev/null
+                source "$CONFIG_FILE"
+            else
+                echo "Warning: Config file missing locally after sync attempt."
+            fi
         fi
 
-        # Check if the 'start' file exists on the remote source server
-        if ssh "$HOST" "[ -f /mnt/user/appdata/backupserver/start ]"; then
+        # Check for remote start flag/lock file
+        if ssh -o BatchMode=yes -o ConnectTimeout=5 "$HOST" "[ -f $LOCK_FILE ]"; then
             start="yes"
         else
             start="no"
@@ -58,232 +123,230 @@ Check_Source_Server() {
     fi
 }
 
-#######################################################################################
+# -----------------------------------------------------------------------------------------
+# Function: sync_data_loop
+# Purpose:  Iterates through numbered variables (source1..9, dest1..9) and runs rsync.
+# Inputs:   $1 = "main" (for array data) or "appdata" (for docker appdata)
+# Safety:   Includes CRITICAL checks to ensure source/dest variables are not empty.
+#           This prevents "rsync --delete / /" scenarios which wipe servers.
+# -----------------------------------------------------------------------------------------
+sync_data_loop() {
+    local type="$1" 
+    
+    # Loop 1 through 9
+    for i in {1..9}; do
+        # Indirect variable expansion to get values of source1, source2, etc.
+        if [ "$type" == "main" ]; then
+            local src_var="source$i"
+            local dest_var="destination$i"
+        else
+            local src_var="appsource$i"
+            local dest_var="appdestination$i"
+        fi
 
-# sync data from source server to backup server
+        local src="${!src_var}"
+        local dest="${!dest_var}"
+
+        # 1. SKIP IF EMPTY: If variables aren't set in config, skip this number
+        if [[ -z "$src" ]] || [[ -z "$dest" ]]; then
+            continue
+        fi
+        
+        # 2. ROOT PROTECTION: Prevent accidental sync to root directory
+        if [[ "$dest" == "/" ]]; then
+            echo "CRITICAL SAFETY ERROR: Destination is set to root (/). Skipping Set $i."
+            send_notification "alert" "Skipped Sync Set $i due to root destination safety check."
+            continue
+        fi
+
+        echo "-----------------------------------------------------"
+        echo "Syncing $type Set $i"
+        echo "Source:      $src"
+        echo "Destination: $dest"
+        echo "-----------------------------------------------------"
+        
+        # 3. EXECUTE RSYNC
+        # --delete: Removes files on backup that no longer exist on source
+        # --timeout: Fails if no data transferred for 600 seconds (prevents hangs)
+        rsync -avhsP --delete --timeout=600 "$HOST":"$src" "$dest"
+        
+        local rsync_status=$?
+        if [ $rsync_status -ne 0 ]; then
+             send_notification "alert" "Rsync failed for $src with error code $rsync_status"
+        fi
+    done
+}
+
+# -----------------------------------------------------------------------------------------
+# Function: syncmaindata
+# Purpose:  Wrapper that checks if 'copymaindata' is enabled before triggering the loop.
+# -----------------------------------------------------------------------------------------
 syncmaindata() {
-    # Check if main data backup is enabled
     if [ "$copymaindata" == "yes" ]; then
-        
-        # Loop through numbers 1 to 9
-        for i in {1..9}; do
-            # Dynamically construct the variable names (e.g., source1, destination1)
-            src_var="source$i"
-            dest_var="destination$i"
-
-            # Use Bash "indirect expansion" to get the actual value stored in those variables
-            src="${!src_var}"
-            dest="${!dest_var}"
-
-            # Only run rsync if BOTH source and destination have values
-            if [ -n "$src" ] && [ -n "$dest" ]; then
-                echo "Syncing Main Data Set $i: $src -> $dest"
-                rsync -avhsP --delete "$HOST":"$src" "$dest"
-            fi
-        done
-    fi
-}
-
-#######################################################################################
-
-syncappdata() {
-    # Check if appdata backup is enabled
-    if [ "$copyappdata" == "yes" ]; then
-        
-        shutdowncontainersbackup
-        shutdowncontainerssource 
-
-        # Loop through numbers 1 to 9
-        for i in {1..9}; do
-            # Dynamically construct the variable names (e.g., appsource1, appdestination1)
-            src_var="appsource$i"
-            dest_var="appdestination$i"
-
-            # Use Bash "indirect expansion" to get the actual value stored in those variables
-            src="${!src_var}"
-            dest="${!dest_var}"
-
-            # Only run rsync if BOTH source and destination have values
-            if [ -n "$src" ] && [ -n "$dest" ]; then
-                echo "Syncing Set $i: $src -> $dest"
-                rsync -avhsP --delete "$HOST":"$src" "$dest"
-            fi
-        done
-
-        startupcontainers
-    fi
-}
-
-#######################################################################################
-
-# this function cleans up and exits script shutting down server if that has been set
-endandshutdown() {
-    # 1. CLEANUP FIRST
-    # We remove the start flag on the source server *before* potentially powering off.
-    # In the original script, if 'poweroff' ran first, the script might die 
-    # before reaching the cleanup line.
-    ssh "$HOST" 'rm -f /mnt/user/appdata/backupserver/start'
-
-    # 2. HANDLE POWER STATE
-    if [ "$poweroff" = "backup" ]; then
-        echo "Shutting down backup server"
-        poweroff
-        
-    elif [ "$poweroff" = "source" ]; then
-        echo "Shutting down source server"
-        # Send poweroff command to source
-        ssh "$HOST" 'poweroff'
-        echo "Source server will shut off shortly"
-        
-        # Create local marker file
-        touch /mnt/user/appdata/backupserver/i_shutdown_source_server
-        
+        echo "Initiating Main Data Sync..."
+        sync_data_loop "main"
     else
-        echo "Neither Source nor Backup server set to turn off"
+        echo "Main Data Sync skipped (Config setting: copymaindata != yes)"
     fi
 }
 
-
-#######################################################################################
-
-# this function plays completion tune when sync finished (will not work without beep speaker)
-completiontune() {
-    # Check if 'beep' is installed to prevent errors
-    if ! command -v beep &> /dev/null; then
-        echo "Speaker tool 'beep' not found. Skipping tune."
-        return
+# -----------------------------------------------------------------------------------------
+# Function: syncappdata
+# Purpose:  Wrapper for Appdata sync. 
+# Logic:    1. STOPS containers on Backup (prevent DB corruption).
+#           2. STOPS containers on Source (prevent DB corruption).
+#           3. Runs the sync.
+#           4. STARTS containers (based on configuration).
+# -----------------------------------------------------------------------------------------
+syncappdata() {
+    if [ "$copyappdata" == "yes" ]; then
+        echo "Initiating Appdata Sync..."
+        
+        shutdowncontainers "backup"
+        shutdowncontainers "source"
+        
+        sync_data_loop "appdata"
+        
+        startupcontainers
+    else
+        echo "Appdata Sync skipped (Config setting: copyappdata != yes)"
     fi
-
-    # Play tune (broken into multiple lines for readability)
-    beep \
-    -l 600 -f 329.628 -n -l 400 -f 493.883 -n -l 200 -f 329.628 -n -l 200 -f 493.883 -n -l 200 -f 659.255 -n \
-    -l 600 -f 329.628 -n -l 400 -f 493.883 -n -l 200 -f 329.628 -n -l 200 -f 493.883 -n -l 200 -f 659.255 -n \
-    -l 600 -f 329.628 -n -l 360 -f 493.883 -n -l 200 -f 329.628 -n -l 200 -f 493.883 -n -l 640 -f 659.255 -n \
-    -l 160 -f 622.254 -n -l 200 -f 329.628 -n -l 200 -f 554.365 -n -l 200 -f 329.628 -n -l 200 -f 622.254 -n \
-    -l 200 -f 493.883 -n -l 200 -f 830.609 -n -l 200 -f 415.305 -n -l 80 -f 739.989 -n -l 40 -f 783.991 -n \
-    -l 80 -f 739.989 -n -l 200 -f 415.305 -n -l 200 -f 659.255 -n -l 200 -f 622.254 -n -l 400 -f 554.365 -n \
-    -l 1320 -f 415.305 -n -l 40 -f 7458.62 -n -l 40 -f 7040.0 -n -l 40 -f 4186.01 -n -l 40 -f 3729.31 -n \
-    -l 40 -f 6644.88 -n -l 40 -f 7902.13 -n -l 40 -f 16.35 -n -l 200 -f 830.609 -n -l 200 -f 415.305 -n \
-    -l 40 -f 739.989 -n -l 80 -f 783.991 -n -l 80 -f 739.989 -n -l 200 -f 415.305 -n -l 200 -f 659.255 -n \
-    -l 200 -f 622.254 -n -l 400 -f 554.365 -n -l 1320 -f 415.305 -n -l 40 -f 4698.64
 }
 
+###########################################################################################
+#                            CONTAINER MANAGEMENT LOGIC                                   #
+###########################################################################################
 
-#######################################################################################
+# -----------------------------------------------------------------------------------------
+# Function: shutdowncontainers
+# Purpose:  Stops the containers defined in 'container_list'.
+# Inputs:   $1 = "source" (Remote server) or "backup" (Local server)
+# -----------------------------------------------------------------------------------------
+shutdowncontainers() {
+    local target="$1"
+    
+    # Skip if list is empty
+    if [ ${#container_list[@]} -eq 0 ]; then return; fi
 
+    if [ "$target" == "source" ]; then
+        echo "Stopping containers on REMOTE (Source)..."
+        for cont in "${container_list[@]}"; do
+            ssh "$HOST" "docker stop \"$cont\""
+        done
+    else
+        echo "Stopping containers on LOCAL (Backup)..."
+        for cont in "${container_list[@]}"; do
+            docker stop "$cont"
+        done
+    fi
+    
+    echo "Waiting 10s for databases to flush and close gracefully..."
+    sleep 10
+}
+
+# -----------------------------------------------------------------------------------------
+# Function: startupcontainers
+# Purpose:  Restarts containers after sync is complete.
+# Logic:    Determines WHERE to start containers based on 'switchserver' variable.
+#           switchserver=yes -> Start on Backup (Failover mode/Migration)
+#           switchserver=no  -> Start on Source (Standard Backup)
+# -----------------------------------------------------------------------------------------
 startupcontainers() {
-    # Check if there are any containers to start (Array length check)
-    if [ ${#container_start_stop[@]} -eq 0 ]; then
-        echo "No containers specified to start."
-        return
-    fi
+    if [ ${#container_list[@]} -eq 0 ]; then return; fi
 
-    # Case 1: Switch Server = YES (Start containers HERE on Backup server)
     if [ "$switchserver" == "yes" ]; then
-        echo "Starting specified containers on LOCAL (Backup) server..."
-        
-        for contval in "${container_start_stop[@]}"; do
-            echo "Starting: $contval"
-            docker start "$contval"
+        echo "Starting containers on LOCAL (Backup) server..."
+        for cont in "${container_list[@]}"; do
+            docker start "$cont"
         done
-
-    # Case 2: Switch Server = NO (Start containers THERE on Source server)
     elif [ "$switchserver" == "no" ]; then
-        echo "Starting specified containers on REMOTE (Source) server..."
-        
-        for contval in "${container_start_stop[@]}"; do
-            echo "Starting remote: $contval"
-            # Note: We escaped the quotes around the container name (\"...\")
-            # to handle container names with spaces correctly over SSH.
-            ssh "$HOST" "docker start \"$contval\""
+        echo "Starting containers on REMOTE (Source) server..."
+        for cont in "${container_list[@]}"; do
+            ssh "$HOST" "docker start \"$cont\""
         done
     fi
 }
 
-
-#######################################################################################
-
-shutdowncontainerssource() {
-    # Check if there are any containers to stop
-    if [ ${#container_start_stop[@]} -eq 0 ]; then
-        echo "No containers specified to stop on source."
-        return
-    fi
-
-    echo "Shutting down specified containers on REMOTE (Source) server..."
-
-    for contval in "${container_start_stop[@]}"; do
-        echo "Stopping remote: $contval"
-        # Escape quotes to handle container names with spaces over SSH
-        ssh "$HOST" "docker stop \"$contval\""
-    done
+# -----------------------------------------------------------------------------------------
+# Function: startcontainers_failover
+# Purpose:  Emergency function called only if Source server is detected as offline.
+# -----------------------------------------------------------------------------------------
+startcontainers_failover() { 
+    if [ ${#container_list[@]} -eq 0 ]; then return; fi
     
-    # Allow time for containers to gracefully shut down
-    echo "Waiting 10 seconds for containers to settle..."
-    sleep 10
-}
-
-#######################################################################################
-
-shutdowncontainersbackup() {
-    # Check if there are any containers to stop
-    if [ ${#container_start_stop[@]} -eq 0 ]; then
-        echo "No containers specified to stop on backup."
-        return
-    fi
-
-    echo "Shutting down specified containers on LOCAL (Backup) server before sync..."
-
-    for contval in "${container_start_stop[@]}"; do
-        echo "Stopping: $contval"
-        docker stop "$contval"
-    done
-    
-    # Allow time for containers to gracefully shut down
-    echo "Waiting 10 seconds for containers to settle..."
-    sleep 10
-}
-
-
-#######################################################################################
-
-startcontainers_if_main_off() { 
-    # Check if there are any containers to start (Failover)
-    if [ ${#container_start[@]} -eq 0 ]; then
-        echo "No failover containers specified to start."
-        return
-    fi
-
-    echo "Source server is OFF. Starting failover containers on Backup server..."
-
-    for contval in "${container_start[@]}"; do
-       echo "Starting: $contval"
-       docker start "$contval"
+    echo "Failover Triggered: Starting local containers."
+    for cont in "${container_list[@]}"; do
+       docker start "$cont"
     done
 }
 
-#######################################################################################
+###########################################################################################
+#                               CLEANUP & SHUTDOWN                                        #
+###########################################################################################
 
+# -----------------------------------------------------------------------------------------
+# Function: endandshutdown
+# Purpose:  1. Deletes the 'start' lock file on the source (job done).
+#           2. Checks 'poweroff' config to see if either server should shut down.
+#           3. Sends final success notification.
+# -----------------------------------------------------------------------------------------
+endandshutdown() {
+    # Remove remote lock file to signal completion
+    ssh "$HOST" "rm -f $LOCK_FILE"
+
+    if [ "$poweroff" == "backup" ]; then
+        send_notification "normal" "Backup complete. Shutting down LOCAL server."
+        /sbin/powerdown
+    elif [ "$poweroff" == "source" ]; then
+        send_notification "normal" "Backup complete. Shutting down SOURCE server."
+        ssh "$HOST" '/sbin/powerdown'
+        
+        # Create a local marker so we know we shut the source down intentionally
+        touch "${CONFIG_DIR}/i_shutdown_source_server"
+    else
+        send_notification "normal" "Backup job finished successfully. No shutdown requested."
+    fi
+}
+
+###########################################################################################
+#                                   MAIN EXECUTION                                        #
+###########################################################################################
+
+# -----------------------------------------------------------------------------------------
+# Function: Main_Sync_Function
+# Purpose:  The orchestrator. Checks flags and calls the sync functions in order.
+# -----------------------------------------------------------------------------------------
 Main_Sync_Function() {
-    # Combine logic: Run if 'start' flag is present OR 'forcestart' is enabled
-    # This removes the need for two duplicate blocks of code
+    # Run if the source requested it ($start) OR if we forced it locally ($forcestart)
     if [ "$start" == "yes" ] || [ "$forcestart" == "yes" ]; then
-        echo "Starting Sync Process..."
+        send_notification "normal" "Starting Backup Routine..."
+        
         syncmaindata 
         syncappdata 
-        completiontune
         endandshutdown 
+        
     else
-        # If neither condition is met, exit
-        echo "Source server didn't start the backup server, and force start is not enabled."
-        echo "Sync job not requested."
-        echo "Source server status: $sourceserverstatus"
-        exit 0
+        echo "Sync not requested by source, and 'forcestart' is not enabled."
+        echo "Exiting."
     fi
 }
 
-############# Start process #############################################################
-Check_Source_Server
-Main_Sync_Function 2>&1 | ssh "$HOST" -T tee -a "$logname"
+# -----------------------------------------------------------------------------------------
+# Script Entry Point
+# -----------------------------------------------------------------------------------------
 
-exit
+# 1. Run server checks
+Check_Source_Server
+
+# 2. Run Main Routine with logging
+#    We use 'tee' to send output to the local console AND append it to the log file 
+#    on the REMOTE server via SSH.
+if [[ -n "$logname" ]]; then
+    echo "Logging output to local console and remote file: $logname"
+    Main_Sync_Function 2>&1 | tee >(ssh "$HOST" "cat >> \"$logname\"")
+else
+    echo "Logging output to local console only."
+    Main_Sync_Function
+fi
+
+exit 0
