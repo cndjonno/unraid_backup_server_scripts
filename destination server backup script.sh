@@ -1,235 +1,285 @@
 #!/bin/bash
-# backup server script -- needs source server script setup on source server to work
+# TITLE: backup server script
+# WARNING: needs source server script setup on source server to work
 umask 0000
 ############# Basic settings ##########################################################
-source_server_ip="192.168.1.10" # set to the ip of the source server
+source_server_ip="192.168.4.2" # set to the ip of the source server
 forcestart="no"  # default is "no" - set to yes to force process to run even if source server didn't request
-
-############# advanced/optional settings ##############################################
 checkandstart="no" # default is "no" - set to yes for script to start below containers if main server is NOT running
 declare -a container_start=("EmbyServerBeta" "swag") # put each container name in quotes ie container_start_stop=("EmbyServerBeta" "swag")
-##
+
+############# Declared Variables ##########################################################
 HOST="root@""$source_server_ip" # dont change
 CONFI="/mnt/user/appdata/backupserver/" # dont change
 
 #############  Functions ##############################################################
+Check_Source_Server() {
+    # Check if source server is reachable (Ping 3 times, quiet output)
+    # Using 'if ! ping' is cleaner than checking $?
+    if ! ping -c3 -q "$source_server_ip" &>/dev/null; then
+        # --- Server is OFF ---
+        sourceserverstatus="off"
+        echo "Source server is off."
 
-Check_Source_Server () {
-ping $source_server_ip -c3 > /dev/null 2>&1 ; yes=$? ; #ping source server 3 times to check for reply
-  if [ ! $yes == 0 ] ;then
-  sourceserverstatus="off"
-  else
-  sourceserverstatus="on"
-fi
+        if [ "$checkandstart" == "yes" ]; then
+            echo "I will start selected containers"
+            startcontainers_if_main_off
+        else
+            echo "Exiting"
+        fi
+        
+        # Exit script immediately since server is off
+        exit 0
+    else
+        # --- Server is ON ---
+        sourceserverstatus="on"
+        
+        # Prepare config directory
+        mkdir -p "$CONFI"
 
-# check if containers should be started if source server is not running
-if [ "$sourceserverstatus" == "off" ] && [ "$checkandstart" == "yes" ]; then
-echo "Source server is off. I will start selected containers"
-startcontainers_if_main_off
-exit
-fi
-if [ "$sourceserverstatus" == "off" ]; then
-echo "Source server is off. Exiting"
-exit
-else
-# read config file written by source server to set variables
-mkdir -p "$CONFI"
-rsync -avhsP  "$HOST":"$CONFI" "$CONFI" ||  start="no";
-source "$CONFI"config.cfg
-ssh "$HOST" [[ -f /mnt/user/appdata/backupserver/start ]] && start="yes" ||  start="no";
-fi
+        # Sync config file. If rsync fails, set start="no"
+        if ! rsync -avhsP "$HOST":"$CONFI" "$CONFI"; then
+            start="no"
+        fi
+
+        # Source the configuration file if it exists
+        if [ -f "${CONFI}config.cfg" ]; then
+            source "${CONFI}config.cfg"
+        else
+            echo "Warning: Config file not found at ${CONFI}config.cfg"
+        fi
+
+        # Check if the 'start' file exists on the remote source server
+        if ssh "$HOST" "[ -f /mnt/user/appdata/backupserver/start ]"; then
+            start="yes"
+        else
+            start="no"
+        fi
+    fi
 }
 
 #######################################################################################
 
 # sync data from source server to backup server
-syncmaindata () {
-if [ "$copymaindata" == "yes"  ] ; then
-# the locations below will be synced (these are defined in basic settings)
-if [ "$source1" != "" ] && [ "$destination1" != ""  ] ; then
-rsync -avhsP --delete  "$HOST":"$source1" "$destination1"    # first location to sync
-fi
-if [ "$source2" != "" ] && [ "$destination2" != ""  ] ; then
-rsync -avhsP --delete  "$HOST":"$source2" "$destination2"    # second location to sync
-fi
-if [ "$source3" != "" ] && [ "$destination3" != ""  ] ; then
-rsync -avhsP --delete "$HOST":"$source3" "$destination3"  # third location to sync
-fi
-if [ "$source4" != "" ] && [ "$destination4" != ""  ] ; then
-rsync -avhsP --delete "$HOST":"$source4" "$destination4"  # forth location to sync
-fi
-if [ "$source5" != "" ] && [ "$destination5" != ""  ] ; then
-rsync -avhsP --delete "$HOST":"$source5" "$destination5"    # fifth location to sync
-fi
-if [ "$source6" != "" ] && [ "$destination6" != ""  ] ; then
-rsync -avhsP --delete "$HOST":"$source6" "$destination6"    # sixth location to sync
-fi
-if [ "$source7" != "" ] && [ "$destination7" != ""  ] ; then
-rsync -avhsP --delete "$HOST":"$source7" "$destination7"  # seventh location to sync
-fi
-if [ "$source8" != "" ] && [ "$destination8" != ""  ] ; then
-rsync -avhsP --delete "$HOST":"$source8" "$destination8"  # eighth location to sync
-fi
-if [ "$source9" != "" ] && [ "$destination9" != ""  ] ; then
-rsync -avhsP --delete "$HOST":"$source9" "$destination9"  # ninth location to sync
-fi
+syncmaindata() {
+    # Check if main data backup is enabled
+    if [ "$copymaindata" == "yes" ]; then
+        
+        # Loop through numbers 1 to 9
+        for i in {1..9}; do
+            # Dynamically construct the variable names (e.g., source1, destination1)
+            src_var="source$i"
+            dest_var="destination$i"
 
-fi
+            # Use Bash "indirect expansion" to get the actual value stored in those variables
+            src="${!src_var}"
+            dest="${!dest_var}"
+
+            # Only run rsync if BOTH source and destination have values
+            if [ -n "$src" ] && [ -n "$dest" ]; then
+                echo "Syncing Main Data Set $i: $src -> $dest"
+                rsync -avhsP --delete "$HOST":"$src" "$dest"
+            fi
+        done
+    fi
 }
 
 #######################################################################################
 
-syncappdata () {
-if [ "$copyappdata" == "yes"  ] ; then
-shutdowncontainersbackup
-shutdowncontainerssource 
+syncappdata() {
+    # Check if appdata backup is enabled
+    if [ "$copyappdata" == "yes" ]; then
+        
+        shutdowncontainersbackup
+        shutdowncontainerssource 
 
-if [ "$appsource1" != "" ] && [ "$appdestination1" != ""  ] ; then
-rsync -avhsP --delete "$HOST":"$appsource1" "$appdestination1"    # first appdata location to sync
-fi
-if [ "$appsource2" != "" ] && [ "$appdestination2" != ""  ] ; then
-rsync -avhsP --delete "$HOST":"$appsource2" "$appdestination2"    # second appdata location to sync
-fi
-if [ "$appsource3" != "" ] && [ "$appdestination3" != ""  ] ; then
-rsync -avhsP --delete "$HOST":"$appsource3" "$appdestination3"  # third appdata location to sync
-fi
-if [ "$appsource4" != "" ] && [ "$appdestination4" != ""  ] ; then
-rsync -avhsP --delete "$HOST":"$appsource4" "$appdestination4"  # forth appdata location to sync
-fi
-if [ "$appsource5" != "" ] && [ "$appdestination5" != ""  ] ; then
-rsync -avhsP --delete "$HOST":"$appsource5" "$appdestination5"    # fifth appdata location to sync
-fi
-if [ "$appsource6" != "" ] && [ "$appdestinatio62" != ""  ] ; then
-rsync -avhsP --delete "$HOST":"$appsource6" "$appdestination6"    # sixth appdata location to sync
-fi
-if [ "$appsource7" != "" ] && [ "$appdestination7" != ""  ] ; then
-rsync -avhsP --delete "$HOST":"$appsource7" "$appdestination7"  # seventh appdata location to sync
-fi
-if [ "$appsource8" != "" ] && [ "$appdestination8" != ""  ] ; then
-rsync -avhsP --delete "$HOST":"$appsource8" "$appdestination8"  # eighth appdata location to sync
-fi
-if [ "$appsource9" != "" ] && [ "$appdestination9" != ""  ] ; then
-rsync -avhsP --delete "$HOST":"$appsource9" "$appdestination9"  # ninth appdata location to sync
-fi
+        # Loop through numbers 1 to 9
+        for i in {1..9}; do
+            # Dynamically construct the variable names (e.g., appsource1, appdestination1)
+            src_var="appsource$i"
+            dest_var="appdestination$i"
 
-startupcontainers
-fi
+            # Use Bash "indirect expansion" to get the actual value stored in those variables
+            src="${!src_var}"
+            dest="${!dest_var}"
+
+            # Only run rsync if BOTH source and destination have values
+            if [ -n "$src" ] && [ -n "$dest" ]; then
+                echo "Syncing Set $i: $src -> $dest"
+                rsync -avhsP --delete "$HOST":"$src" "$dest"
+            fi
+        done
+
+        startupcontainers
+    fi
 }
 
 #######################################################################################
 
 # this function cleans up and exits script shutting down server if that has been set
-endandshutdown () {
+endandshutdown() {
+    # 1. CLEANUP FIRST
+    # We remove the start flag on the source server *before* potentially powering off.
+    # In the original script, if 'poweroff' ran first, the script might die 
+    # before reaching the cleanup line.
+    ssh "$HOST" 'rm -f /mnt/user/appdata/backupserver/start'
 
-if [ "$poweroff" == "backup"  ] ; then
-echo "Shutting down backup server"
-poweroff # shutdown backup server
-
-elif [ "$poweroff" == "source"  ] ; then
-ssh "$HOST" 'poweroff'  # shutdown source server to shutdown
-echo "source server will shut off shortly"
-touch /mnt/user/appdata/backupserver/i_shutdown_source_server
-
-else
-echo "Neither Source nor backup server set to turn off"
-fi
-
-ssh "$HOST" 'rm /mnt/user/appdata/backupserver/start' 
-
+    # 2. HANDLE POWER STATE
+    if [ "$poweroff" = "backup" ]; then
+        echo "Shutting down backup server"
+        poweroff
+        
+    elif [ "$poweroff" = "source" ]; then
+        echo "Shutting down source server"
+        # Send poweroff command to source
+        ssh "$HOST" 'poweroff'
+        echo "Source server will shut off shortly"
+        
+        # Create local marker file
+        touch /mnt/user/appdata/backupserver/i_shutdown_source_server
+        
+    else
+        echo "Neither Source nor Backup server set to turn off"
+    fi
 }
+
 
 #######################################################################################
 
 # this function plays completion tune when sync finished (will not work without beep speaker)
-completiontune () {
-beep -l 600 -f 329.627556913 -n -l 400 -f 493.883301256 -n -l 200 -f 329.627556913 -n -l 200 -f 493.883301256 -n -l 200 -f 659.255113826 -n -l 600 -f 329.627556913 -n -l 400 -f 493.883301256 -n -l 200 -f 329.627556913 -n -l 200 -f 493.883301256 -n -l 200 -f 659.255113826 -n -l 600 -f 329.627556913 -n -l 360 -f 493.883301256 -n -l 200 -f 329.627556913 -n -l 200 -f 493.883301256 -n -l 640 -f 659.255113826 -n -l 160 -f 622.253967444 -n -l 200 -f 329.627556913 -n -l 200 -f 554.365261954 -n -l 200 -f 329.627556913 -n -l 200 -f 622.253967444 -n -l 200 -f 493.883301256 -n -l 200 -f 830.60939516 -n -l 200 -f 415.30469758 -n -l 80 -f 739.988845423 -n -l 40 -f 783.990871963 -n -l 80 -f 739.988845423 -n -l 200 -f 415.30469758 -n -l 200 -f 659.255113826 -n -l 200 -f 622.253967444 -n -l 400 -f 554.365261954 -n -l 1320 -f 415.30469758 -n -l 40 -f 7458.62018429 -n -l 40 -f 7040.0 -n -l 40 -f 4186.00904481 -n -l 40 -f 3729.31009214 -n -l 40 -f 6644.87516128 -n -l 40 -f 7902.1328201 -n -l 40 -f 16.3515978313 -n -l 200 -f 830.60939516 -n -l 200 -f 415.30469758 -n -l 40 -f 739.988845423 -n -l 80 -f 783.990871963 -n -l 80 -f 739.988845423 -n -l 200 -f 415.30469758 -n -l 200 -f 659.255113826 -n -l 200 -f 622.253967444 -n -l 400 -f 554.365261954 -n -l 1320 -f 415.30469758 -n -l 40 -f 4698.63628668
+completiontune() {
+    # Check if 'beep' is installed to prevent errors
+    if ! command -v beep &> /dev/null; then
+        echo "Speaker tool 'beep' not found. Skipping tune."
+        return
+    fi
+
+    # Play tune (broken into multiple lines for readability)
+    beep \
+    -l 600 -f 329.628 -n -l 400 -f 493.883 -n -l 200 -f 329.628 -n -l 200 -f 493.883 -n -l 200 -f 659.255 -n \
+    -l 600 -f 329.628 -n -l 400 -f 493.883 -n -l 200 -f 329.628 -n -l 200 -f 493.883 -n -l 200 -f 659.255 -n \
+    -l 600 -f 329.628 -n -l 360 -f 493.883 -n -l 200 -f 329.628 -n -l 200 -f 493.883 -n -l 640 -f 659.255 -n \
+    -l 160 -f 622.254 -n -l 200 -f 329.628 -n -l 200 -f 554.365 -n -l 200 -f 329.628 -n -l 200 -f 622.254 -n \
+    -l 200 -f 493.883 -n -l 200 -f 830.609 -n -l 200 -f 415.305 -n -l 80 -f 739.989 -n -l 40 -f 783.991 -n \
+    -l 80 -f 739.989 -n -l 200 -f 415.305 -n -l 200 -f 659.255 -n -l 200 -f 622.254 -n -l 400 -f 554.365 -n \
+    -l 1320 -f 415.305 -n -l 40 -f 7458.62 -n -l 40 -f 7040.0 -n -l 40 -f 4186.01 -n -l 40 -f 3729.31 -n \
+    -l 40 -f 6644.88 -n -l 40 -f 7902.13 -n -l 40 -f 16.35 -n -l 200 -f 830.609 -n -l 200 -f 415.305 -n \
+    -l 40 -f 739.989 -n -l 80 -f 783.991 -n -l 80 -f 739.989 -n -l 200 -f 415.305 -n -l 200 -f 659.255 -n \
+    -l 200 -f 622.254 -n -l 400 -f 554.365 -n -l 1320 -f 415.305 -n -l 40 -f 4698.64
 }
+
 
 #######################################################################################
 
 startupcontainers() {
+    # Check if there are any containers to start (Array length check)
+    if [ ${#container_start_stop[@]} -eq 0 ]; then
+        echo "No containers specified to start."
+        return
+    fi
 
-if [ "$switchserver" == "yes"  ] ; then
+    # Case 1: Switch Server = YES (Start containers HERE on Backup server)
+    if [ "$switchserver" == "yes" ]; then
+        echo "Starting specified containers on LOCAL (Backup) server..."
+        
+        for contval in "${container_start_stop[@]}"; do
+            echo "Starting: $contval"
+            docker start "$contval"
+        done
 
-for contval in "${container_start_stop[@]}"
-do
-   echo "Starting specified containers on backup server ....." 
-   docker start "$contval"
-   echo 
-done
-fi
-
-if [ "$switchserver" == "no"  ] ; then
-
-for contval in "${container_start_stop[@]}"
-do
-   echo "Starting specified containers on source server  ....." 
-  ssh "$HOST" docker start "$contval"
-   echo 
-done
-fi
+    # Case 2: Switch Server = NO (Start containers THERE on Source server)
+    elif [ "$switchserver" == "no" ]; then
+        echo "Starting specified containers on REMOTE (Source) server..."
+        
+        for contval in "${container_start_stop[@]}"; do
+            echo "Starting remote: $contval"
+            # Note: We escaped the quotes around the container name (\"...\")
+            # to handle container names with spaces correctly over SSH.
+            ssh "$HOST" "docker start \"$contval\""
+        done
+    fi
 }
+
 
 #######################################################################################
 
 shutdowncontainerssource() {
+    # Check if there are any containers to stop
+    if [ ${#container_start_stop[@]} -eq 0 ]; then
+        echo "No containers specified to stop on source."
+        return
+    fi
 
-for contval in "${container_start_stop[@]}"
-do
-  echo "Shutting down specified containers on host ....." 
-  ssh "$HOST" docker stop "$contval"
-  echo 
-done
-sleep 10
+    echo "Shutting down specified containers on REMOTE (Source) server..."
+
+    for contval in "${container_start_stop[@]}"; do
+        echo "Stopping remote: $contval"
+        # Escape quotes to handle container names with spaces over SSH
+        ssh "$HOST" "docker stop \"$contval\""
+    done
+    
+    # Allow time for containers to gracefully shut down
+    echo "Waiting 10 seconds for containers to settle..."
+    sleep 10
 }
 
 #######################################################################################
 
 shutdowncontainersbackup() {
+    # Check if there are any containers to stop
+    if [ ${#container_start_stop[@]} -eq 0 ]; then
+        echo "No containers specified to stop on backup."
+        return
+    fi
 
-for contval in "${container_start_stop[@]}"
-do
-  echo "Shutting down specified containers on backup server before sync ....." 
-  docker stop "$contval"
-  echo 
-done
-sleep 10
+    echo "Shutting down specified containers on LOCAL (Backup) server before sync..."
+
+    for contval in "${container_start_stop[@]}"; do
+        echo "Stopping: $contval"
+        docker stop "$contval"
+    done
+    
+    # Allow time for containers to gracefully shut down
+    echo "Waiting 10 seconds for containers to settle..."
+    sleep 10
 }
+
 
 #######################################################################################
 
 startcontainers_if_main_off() { 
-for contval in "${container_start[@]}"
-do
-   docker start "$contval"
-done
+    # Check if there are any containers to start (Failover)
+    if [ ${#container_start[@]} -eq 0 ]; then
+        echo "No failover containers specified to start."
+        return
+    fi
+
+    echo "Source server is OFF. Starting failover containers on Backup server..."
+
+    for contval in "${container_start[@]}"; do
+       echo "Starting: $contval"
+       docker start "$contval"
+    done
 }
 
 #######################################################################################
 
-Main_Sync_Function () {
-
-# check if main server started process by making start flag file, then start sync
-if [ "$start" == "yes" ] ; then
-syncmaindata 
-syncappdata 
-completiontune
-endandshutdown 
-
-# check if set to forcesync and if so, then start sync
-elif  [ "$forcestart" == "yes"  ] ; then
-syncmaindata 
-syncappdata 
-completiontune
-endandshutdown 
-
-
-# If source server didnt request sync then exit
-else
-echo "Source server didn't start the backup server so sync job has not been requested"
-echo "Source server is " "$sourceserverstatus"
-exit
-fi
+Main_Sync_Function() {
+    # Combine logic: Run if 'start' flag is present OR 'forcestart' is enabled
+    # This removes the need for two duplicate blocks of code
+    if [ "$start" == "yes" ] || [ "$forcestart" == "yes" ]; then
+        echo "Starting Sync Process..."
+        syncmaindata 
+        syncappdata 
+        completiontune
+        endandshutdown 
+    else
+        # If neither condition is met, exit
+        echo "Source server didn't start the backup server, and force start is not enabled."
+        echo "Sync job not requested."
+        echo "Source server status: $sourceserverstatus"
+        exit 0
+    fi
 }
 
 ############# Start process #############################################################
