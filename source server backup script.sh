@@ -1,43 +1,47 @@
 #!/bin/bash
-# source server script -- needs destination server backup scrip on backupup server to work
-umask 0000
-############# Basic settings (these settings cover source and destination scripts    ########################
-############# Set auto server startup method for source and backup server         ###########################
-startbackup="etherwake"   	 # set to choose method used to start backup server: "etherwake" (wake on lan), "ipmi" (for IPMI capable servers) or "smartplug" tasmota smart switch 
-startsource="etherwake"   	 # set to choose method used to start backup server: "etherwake" (wake on lan), "ipmi" (for IPMI capable servers) or "smartplug" tasmota smart switch
-source_ipmiadminuser="admin"     	 # used for IPMI capable servers - admin user for source server
-source_ipmiadminpassword="password" # used for IPMI capable servers - admin user  for source server
-dest_ipmiadminuser="admin"     	 # used for IPMI capable servers - admin user for destination/backup server
-dest_ipmiadminpassword="password" # used for IPMI capable servers - admin user for destination/backup server
-backup_smartplug_ip="http://xxx.xxx.xxx.xxx" # set ip address of tasmota smart plug - ignored if start server set to etherwake
-source_smartplug_ip="http://xxx.xxx.xxx.xxx" # set ip address of tasmota smart plug - ignored if start server set to etherwake
+# Description: Orchestrates Unraid Backup Server Wake-up and Config Generation
+# Author: cndjonno (Refactored)
 
-############# Set Ip and/or macaddresses for source and backup server      #################################
-sourcemacaddress="xx:xx:xx:xx:xx:xx"  # set macaddress of backup servers' NIC (if using etherwake) - ignored if using smartplug
-backupmacaddress="xx:xx:xx:xx:xx:xx"  # set macaddress of backup servers' NIC (if using etherwake) - ignored if using smartplug
-source_server_ip="192.168.1.100"       # set ip address of the sourceserver
-destination_server_ip="192.168.1.101"  # set ip address of the backup server
+# 1. SAFETY: Set permissions so only the owner (root) can read/write generated files
+umask 0077
 
-############# Sync process setiings     ####################################################################
-poweroff="source"         # set to shutdown source server, backup server or neither server after sync --  "none" "both" "source" "backup"
-copymaindata="yes"        # set to copy main array data for selected shares/locations from the source server to the backup server
-copyappdata="yes"         # set to copy appdata for specific containers from the source server to the backup server
+############# Basic Settings ########################
+startbackup="etherwake"         # Methods: "etherwake", "ipmi", "smartplug"
+startsource="etherwake"
+source_ipmiadminuser="admin"
+source_ipmiadminpassword="password"
+dest_ipmiadminuser="admin"
+dest_ipmiadminpassword="password"
+backup_smartplug_ip="http://xxx.xxx.xxx.xxx"
+source_smartplug_ip="http://xxx.xxx.xxx.xxx"
 
-switchserver="yes"        # set to "yes" or "no"  for backup server to take over running specified containers or not - (if poweroff set to backup then this is ignored)
-sync_appdata_both_ways="yes"  # default "yes" - set to "yes" to sync appback data from destination to source server when using switchserver
-sync_maindata_both_ways="no"  # default "no" - set to "yes" to sync back data, as well as appdata from destination to source server when using switchserver
+############# Network Settings ######################
+sourcemacaddress="xx:xx:xx:xx:xx:xx"
+backupmacaddress="xx:xx:xx:xx:xx:xx"
+source_server_ip="192.168.1.100"
+destination_server_ip="192.168.1.101"
 
-# Containers to shutdown before copy (used if wanting to backup appdata of a container or if server is switching servers from source to backup  ie emby/plex )
-declare -a container_start_stop=("null" "null") # put each container name in quotes ie container_start_stop=("EmbyServerBeta" "swag")
+############# Sync Process Settings #################
+poweroff="source"             # "none", "both", "source", "backup"
+copymaindata="yes"
+copyappdata="yes"
+switchserver="yes"            # Backup takes over containers?
+sync_appdata_both_ways="yes"
+sync_maindata_both_ways="no"
 
-# Vms listed below will be checked for and if found running source server will not shutdown if set to
-declare -a vms=("null" "null") # put each vm name for script to check if tunning in quotes ie vms=("PopOS" "Wondows 10")
-continueifvmsrunning="no"  # Default "no" backup server will not start and copy process not continue - If "yes" copy will continue but main server will not shutdown and backup server shutdown afterwards instead. 
+# Containers to start/stop (Space separated strings)
+# Use quotes correctly inside the array if names contain spaces
+declare -a container_start_stop=("null" "null")
 
+# VMs to check prevents shutdown if running
+declare -a vms=("null" "null") 
+continueifvmsrunning="no"     # "yes" = don't shut down source, shut down backup instead
 
-#source directories to backup on source server
-source1=""    # set first source directory to sync - example   source1="/mnt/user/Movies/"
-source2=""  
+############# Source Directories ####################
+# Arrays are cleaner, but keeping your numbered variable format for compatibility 
+# with your destination script logic.
+source1=""
+source2=""
 source3=""
 source4=""
 source5=""
@@ -45,9 +49,9 @@ source6=""
 source7=""
 source8=""
 source9=""
-#source appdata directories to backup on source server
-appsource1=""    # set first source directory to sync - example  appsource1="/mnt/user/appdata/EmbyServer/data/" 
-appsource2=""  
+
+appsource1=""
+appsource2=""
 appsource3=""
 appsource4=""
 appsource5=""
@@ -56,9 +60,9 @@ appsource7=""
 appsource8=""
 appsource9=""
 
-# target directories to sync to on destination server
-destination1=""    # set first destination directory target - example destination1="/mnt/user/Movies/" 
-destination2=""  
+############# Destination Directories ###############
+destination1=""
+destination2=""
 destination3=""
 destination4=""
 destination5=""
@@ -66,9 +70,9 @@ destination6=""
 destination7=""
 destination8=""
 destination9=""
-#target appdata directories to sync to on destination server
-appdestination1=""    # set first source directory to sync - example appdestination1="/mnt/user/appdata/EmbyServer/data/"
-appdestination2=""  
+
+appdestination1=""
+appdestination2=""
 appdestination3=""
 appdestination4=""
 appdestination5=""
@@ -77,264 +81,255 @@ appdestination7=""
 appdestination8=""
 appdestination9=""
 
+############# Advanced Settings #####################
+# Unraid Specific: Using /mnt/cache/ is preferred for appdata if available to avoid FUSE overhead.
+# However, /mnt/user/ is safest for compatibility.
+BASE_DIR="/mnt/user/appdata/backupserver"
+CONFI="${BASE_DIR}/config.cfg"
+LOG_DIR="${BASE_DIR}/logs"
+LOG_FILE="${LOG_DIR}/$(date +'%Y-%m-%d--%H:%M')--source_to_destination.txt"
+MAX_RETRIES=10  # How many 30-second intervals to wait for backup server (5 mins total)
 
-############# advanced variables/settings ##############################################
-CONFI="/mnt/user/appdata/backupserver/config.cfg"  #dont change
-loglocation="/mnt/user/appdata/backupserver/logs/" #dont change
+#####################################################
+# FUNCTIONS
+#####################################################
 
-logname="$loglocation""$(date +'%Y-%m-%d--%H:%M')"--source_to_destination.txt #dont change
-
-############################# functions ########################################
- 
-shallicontinue () {
-  checkbackupserver
-  if [ "$destserverstatus" == "on"  ] ; then
-    echo "Backup server already running. So Sync must be manually run from backup server"
-    echo "Exiting"
-    exit
-  else
-    echo "Backup server is off....continuing"
-  fi
- vmcheck
-  if [ "$vmrunning" != "true" ] && [ "$poweroff" == "source"  ] ; then
-    echo "No specified VMs are running so its safe for source server to be shutdown"
-
-  elif [ "$vmrunning" = "true" ] && [ "$continueifvmsrunning" = "no" ] ;then
-    echo "One or more specified VMs are running so process will not run"
-    echo "Exiting"
-    exit
-
-  elif [ "$vmrunning" = "true" ] && [ "$continueifvmsrunning" = "yes" ] ;then
-    echo "One or more specified VMs are running so source server will NOT shut down after process is finished"
-    echo "Backup server will be set to shut down instead"
-    poweroff="backup" 
-fi 
+setup_environment() {
+    # Ensure directories exist
+    if [ ! -d "$LOG_DIR" ]; then
+        mkdir -p "$LOG_DIR"
+    fi
+    if [ ! -d "$BASE_DIR" ]; then
+        mkdir -p "$BASE_DIR"
+    fi
 }
 
-######################################
-
-setup () {
-#set flag to shutdown backup or source server after sync
-if [ "$poweroff" == "backup"  ] ; then
-echo "Backup server has been set to turn off after sync"
-switchserver="no" #set switchserver to no as backup server will shutdown
-
-elif [ "$poweroff" == "source"  ] ; then
-echo "Source server has been set to turn off after sync"
-switchserver="yes" #set switchserver to yes as source server will shutdown
-else
-echo "Neither Source nor Backup server is set to be turned off"
-
-fi
-if [ "$switchserver" == "yes"  ] ; then
-copyappdata="yes" # copyappdata set to yes as server duties set to switch
-poweroff="source" # make sure source server is set to shutdown
-echo "Containers are set to start on Backup server after sync completed"
-else
-echo "No containers on Backup server are set to start after sync had completed"
-fi
-
-# make flag file to tell backup server when it starts to start backup process
-touch /mnt/user/appdata/backupserver/start ; echo "Making flag in appdata to tell backupserver job has been requested"
+check_vm_status() {
+    echo "Checking VM status..."
+    vmrunning="false"
+    
+    for vmval in "${vms[@]}"; do
+        if [ "$vmval" == "null" ]; then continue; fi
+        
+        # Unraid Specific: Robust check using virsh domstate
+        # Redirect stderr to dev/null in case VM doesn't exist
+        state=$(virsh domstate "$vmval" 2>/dev/null)
+        
+        if [[ "$state" == "running" ]]; then
+            echo "VM '$vmval' is RUNNING."
+            vmrunning="true"
+        else
+            echo "VM '$vmval' is not running (State: $state)."
+        fi
+    done
 }
 
-######################################
+determine_action() {
+    # check if backup server is already online
+    if ping -c 1 -W 1 "$destination_server_ip" > /dev/null 2>&1; then
+        destserverstatus="on"
+        echo "Backup server is ALREADY ONLINE."
+        echo "WARNING: If an automated sync requires a fresh boot, this may fail."
+        echo "Continuing anyway as requested..."
+    else
+        destserverstatus="off"
+        echo "Backup server is currently OFF."
+    fi
 
-vmcheck () {
-echo "Checking if specified VMs are running"
-for vmval in "${vms[@]}"
-do
-vmstate=$(virsh list --all | grep " $vmval " | awk '{ print $NF}')
-if [ "$vmstate" != "running" ]
-then
-    echo "$vmval"  "is not running."
-else
-    echo "$vmval"  "is running "
-    vmrunning="true"
-fi
-done
+    check_vm_status
+
+    if [ "$vmrunning" == "true" ]; then
+        if [ "$continueifvmsrunning" == "no" ]; then
+            echo "CRITICAL: Specified VMs are running and 'continueifvmsrunning' is set to NO."
+            echo "Exiting script to prevent data loss or service interruption."
+            exit 1
+        else
+            echo "VMs are running, but continuing. Source server will NOT shutdown."
+            poweroff="backup"
+            # If we are not shutting down source, we likely shouldn't switch servers
+            if [ "$switchserver" == "yes" ]; then
+                 echo "Overriding switchserver to 'no' because Source is staying online."
+                 switchserver="no"
+            fi
+        fi
+    else
+        echo "No critical VMs running. Proceeding with standard power logic."
+    fi
+
+    # Logic for Poweroff flags
+    if [ "$poweroff" == "backup" ]; then
+        echo "Config: Backup server will shutdown after sync."
+        switchserver="no"
+    elif [ "$poweroff" == "source" ]; then
+        echo "Config: Source server will shutdown after sync."
+        switchserver="yes"
+    else
+        echo "Config: No servers set to power off."
+    fi
+
+    if [ "$switchserver" == "yes" ]; then
+        copyappdata="yes"
+        poweroff="source" # Enforce source shutdown
+        echo "Config: Server duties will SWITCH to backup server."
+    fi
+
+    # Create the flag file for the destination script
+    touch "${BASE_DIR}/start"
+    echo "Created trigger file at ${BASE_DIR}/start"
 }
 
-######################################
+wait_for_backup_server() {
+    local retry_count=0
+    
+    # If it was already on, we don't need to wait, but we still proceed
+    if [ "$destserverstatus" == "on" ]; then
+        return
+    fi
 
-checkbackupserver () {
-ping $destination_server_ip -c3 > /dev/null 2>&1 ; yes=$? ; #ping backup server 3 times to check for reply
-  if [ ! $yes == 0 ] ;then
-  destserverstatus="off"
-  else
-  destserverstatus="on"
-fi
+    echo "Waiting for backup server to come online..."
+    while [ $retry_count -lt $MAX_RETRIES ]; do
+        if ping -c 1 -W 1 "$destination_server_ip" > /dev/null 2>&1; then
+            echo "Backup server is now ONLINE."
+            destserverstatus="on"
+            return
+        fi
+        
+        echo "Attempt $((retry_count+1)) of $MAX_RETRIES: Server not up yet. Waiting 30s..."
+        ((retry_count++))
+        sleep 30
+    done
+
+    echo "ERROR: Backup server failed to wake up after $((MAX_RETRIES * 30)) seconds."
+    exit 1
 }
 
-######################################
-
-backupserverstatus () {
-#check if backup server has started up yet
-checkbackup=1
-while [ "$destserverstatus" == "off" ]
-do
-  checkbackupserver
-  echo ".............................Checking backup server attempt...""$checkbackup"
-  echo "Backup server not started yet"
-  echo "Waiting 30 seconds to check again"
-  ((checkbackup=checkbackup+1))
-  sleep 30  # wait 30 seconds before rechecking
-done
-echo "Okay server is now on, taking" "$((checkbackup * 30))" "seconds to boot. Backup process should start from the backup server side"
-
-if [ "$poweroff" == "backup"  ] && [ "$startbackup" = "smartplug" ] ;then
-checkbackup=1
-#check if backup server has shutdown
-while [ "$destserverstatus" == "on" ]
-do
-  checkbackupserver
-  echo ".............................Checking backup server attempt...""$checkbackup"
-  echo "Backup server not shutdown"
-  echo "Waiting 30 seconds to check again"
- ((checkbackup=checkbackup+1))
-  sleep 30  # wait 30 seconds before rechecking
-done
-smartplugoff
-echo "backup server is down and smartplug powered off"
-fi
+smartplug_control() {
+    local action=$1 # "on" or "off"
+    local cmd=""
+    if [ "$action" == "on" ]; then cmd="Power%20On"; else cmd="Power%20off"; fi
+    
+    if [ "$startbackup" == "smartplug" ]; then
+        echo "Sending SmartPlug command: $action"
+        curl -s "${backup_smartplug_ip}/cm?cmnd=${cmd}" > /dev/null
+    fi
 }
 
-######################################
-
-smartplugoff () {
-if [ "$startbackup" == "smartplug" ] ; then
-curl "$backup_smartplug_ip"/cm?cmnd=Power%20off  > /dev/null 2>&1 #turn off power by smart plug
-fi
+wake_server() {
+    case "$startbackup" in
+        "smartplug")
+            smartplug_control "off"
+            sleep 5
+            smartplug_control "on"
+            ;;
+        "ipmi")
+            echo "Sending IPMI Power On command..."
+            ipmitool -I lan -H "$destination_server_ip" -U "$dest_ipmiadminuser" -P "$dest_ipmiadminpassword" chassis power on
+            ;;
+        "etherwake"|*)
+            echo "Sending Magic Packet (Wake on LAN)..."
+            etherwake -b "$backupmacaddress"
+            ;;
+    esac
 }
 
-######################################
+write_config_file() {
+    echo "Generating Configuration File at $CONFI..."
+    
+    # OPTIMIZATION: Use cat <<EOF to write the file in one go.
+    # Note: We quote the EOF ("EOF") to prevent expansion of variables during writing if we wanted literals,
+    # but here we WANT variables to expand, so we use unquoted EOF.
+    
+    cat > "$CONFI" <<EOF
+# Generated Configuration File - Do Not Edit Manually
+# Data source directories
+source1="$source1"
+source2="$source2"
+source3="$source3"
+source4="$source4"
+source5="$source5"
+source6="$source6"
+source7="$source7"
+source8="$source8"
+source9="$source9"
 
-smartplugon () {
-if [ "$startbackup" == "smartplug" ] ; then
-curl $backup_smartplug_ip/cm?cmnd=Power%20On  > /dev/null 2>&1 #turn on power and start server
-echo "Attempting to start the backup server"
-fi
+# Appdata source directories
+appsource1="$appsource1"
+appsource2="$appsource2"
+appsource3="$appsource3"
+appsource4="$appsource4"
+appsource5="$appsource5"
+appsource6="$appsource6"
+appsource7="$appsource7"
+appsource8="$appsource8"
+appsource9="$appsource9"
+
+# Destination directories
+destination1="$destination1"
+destination2="$destination2"
+destination3="$destination3"
+destination4="$destination4"
+destination5="$destination5"
+destination6="$destination6"
+destination7="$destination7"
+destination8="$destination8"
+destination9="$destination9"
+
+# Appdata destination directories
+appdestination1="$appdestination1"
+appdestination2="$appdestination2"
+appdestination3="$appdestination3"
+appdestination4="$appdestination4"
+appdestination5="$appdestination5"
+appdestination6="$appdestination6"
+appdestination7="$appdestination7"
+appdestination8="$appdestination8"
+appdestination9="$appdestination9"
+
+# System Variables
+source_server_ip="$source_server_ip"
+destination_server_ip="$destination_server_ip"
+poweroff="$poweroff"
+startbackup="$startbackup"
+startsource="$startsource"
+backup_smartplug_ip="$backup_smartplug_ip"
+source_smartplug_ip="$source_smartplug_ip"
+source_ipmiadminuser="$source_ipmiadminuser"
+source_ipmiadminpassword="$source_ipmiadminpassword"
+dest_ipmiadminuser="$dest_ipmiadminuser"
+dest_ipmiadminpassword="$dest_ipmiadminpassword"
+sourcemacaddress="$sourcemacaddress"
+backupmacaddress="$backupmacaddress"
+copyappdata="$copyappdata"
+copymaindata="$copymaindata"
+switchserver="$switchserver"
+sync_appdata_both_ways="$sync_appdata_both_ways"
+sync_maindata_both_ways="$sync_maindata_both_ways"
+loglocation="$loglocation"
+logname="$logname"
+
+# Arrays reconstructed
+container_start_stop=(${container_start_stop[@]})
+EOF
+
+    echo "Configuration file written successfully."
 }
 
-######################################
+#####################################################
+# MAIN EXECUTION
+#####################################################
 
-wakeonlan () {
-etherwake -b $backupmacaddress
+main() {
+    setup_environment
+    determine_action
+    wake_server
+    write_config_file
+    wait_for_backup_server
+    
+    echo "Sequence complete. Destination server should now pick up the job."
 }
 
-######################################
+# Redirect all output to log file AND console (tee)
+# mkdir check happens in setup_environment, so we run that first manually
+if [ ! -d "$LOG_DIR" ]; then mkdir -p "$LOG_DIR"; fi
 
-ipmi_on () {
-ipmitool -I lan -H "$destination_server_ip" -U "$dest_ipmiadminuser" -P "$dest_ipmiadminpassword" chassis power on
-}
-
-
-######################################
-
-writeconfig () {
-echo
-echo "Writing config file" 
-echo
-echo "# Data source directories to be copied/synced from source server" | sudo tee  $CONFI
-echo "source1=\"$source1\"" | sudo tee  --append $CONFI
-echo "source2=\"$source2\"" | sudo tee  --append $CONFI
-echo "source3=\"$source3\"" | sudo tee  --append $CONFI
-echo "source4=\"$source4\"" | sudo tee  --append $CONFI
-echo "source5=\"$source5\"" | sudo tee  --append $CONFI
-echo "source6=\"$source6\"" | sudo tee  --append $CONFI
-echo "source7=\"$source7\"" | sudo tee  --append $CONFI
-echo "source8=\"$source8\"" | sudo tee  --append $CONFI
-echo "source9=\"$source9\"" | sudo tee  --append $CONFI
-echo "# Appdata source directories to be copied/synced from source server" | sudo tee --append $CONFI
-echo "appsource1=\"$appsource1\"" | sudo tee  --append $CONFI
-echo "appsource2=\"$appsource2\"" | sudo tee  --append $CONFI
-echo "appsource3=\"$appsource3\"" | sudo tee  --append $CONFI
-echo "appsource4=\"$appsource4\"" | sudo tee  --append $CONFI
-echo "appsource5=\"$appsource5\"" | sudo tee  --append $CONFI
-echo "appsource6=\"$appsource6\"" | sudo tee  --append $CONFI
-echo "appsource7=\"$appsource7\"" | sudo tee  --append $CONFI
-echo "appsource8=\"$appsource8\"" | sudo tee  --append $CONFI
-echo "appsource9=\"$appsource9\"" | sudo tee  --append $CONFI
-
-echo "# Destination directories to be copied/synced to on destination server" | sudo tee --append $CONFI
-echo "destination1=\"$destination1\"" | sudo tee  --append $CONFI
-echo "destination2=\"$destination2\"" | sudo tee  --append $CONFI
-echo "destination3=\"$destination3\"" | sudo tee  --append $CONFI
-echo "destination4=\"$destination4\"" | sudo tee  --append $CONFI
-echo "destination5=\"$destination5\"" | sudo tee  --append $CONFI
-echo "destination6=\"$destination6\"" | sudo tee  --append $CONFI
-echo "destination7=\"$destination7\"" | sudo tee  --append $CONFI
-echo "destination8=\"$destination8\"" | sudo tee  --append $CONFI
-echo "destination9=\"$destination9\"" | sudo tee  --append $CONFI
-echo "# Destination appdata directories to be copied/synced to on destination server" | sudo tee --append $CONFI
-echo "appdestination1=\"$appdestination1\"" | sudo tee  --append $CONFI
-echo "appdestination2=\"$appdestination2\"" | sudo tee  --append $CONFI
-echo "appdestination3=\"$appdestination3\"" | sudo tee  --append $CONFI
-echo "appdestination4=\"$appdestination4\"" | sudo tee  --append $CONFI
-echo "appdestination5=\"$appdestination5\"" | sudo tee  --append $CONFI
-echo "appdestination6=\"$appdestination6\"" | sudo tee  --append $CONFI
-echo "appdestination7=\"$appdestination7\"" | sudo tee  --append $CONFI
-echo "appdestination8=\"$appdestination8\"" | sudo tee  --append $CONFI
-echo "appdestination9=\"$appdestination9\"" | sudo tee  --append $CONFI
-
-echo "# other variables" | sudo tee --append $CONFI
-echo "source_server_ip=\"$source_server_ip\"" | sudo tee  --append $CONFI
-echo "destination_server_ip=\"$destination_server_ip\"" | sudo tee  --append $CONFI
-echo "poweroff=\"$poweroff\"" | sudo tee  --append $CONFI
-echo "startbackup=\"$startbackup\"" | sudo tee  --append $CONFI
-echo "startsource=\"$startsource\"" | sudo tee  --append $CONFI
-
-echo "backup_smartplug_ip=\"$backup_smartplug_ip\"" | sudo tee  --append $CONFI
-echo "source_smartplug_ip=\"$source_smartplug_ip\"" | sudo tee  --append $CONFI
-echo "source_ipmiadminuser=\"$source_ipmiadminuser\"" | sudo tee  --append $CONFI
-echo "source_ipmiadminpassword=\"$source_ipmiadminpassword\"" | sudo tee  --append $CONFI
-echo "dest_ipmiadminuser=\"$dest_ipmiadminuser\"" | sudo tee  --append $CONFI
-echo "dest_ipmiadminpassword=\"$dest_ipmiadminpassword\"" | sudo tee  --append $CONFI
-
-echo "sourcemacaddress=\"$sourcemacaddress\"" | sudo tee  --append $CONFI
-echo "backupmacaddress=\"$backupmacaddress\"" | sudo tee  --append $CONFI
-echo "copyappdata=\"$copyappdata\"" | sudo tee  --append $CONFI
-echo "copymaindata=\"$copymaindata\"" | sudo tee  --append $CONFI
-echo "switchserver=\"$switchserver\"" | sudo tee  --append $CONFI
-echo "sync_appdata_both_ways=\"$sync_appdata_both_ways\"" | sudo tee  --append $CONFI
-echo "sync_maindata_both_ways=\"$sync_maindata_both_ways\"" | sudo tee  --append $CONFI
-echo "container_start_stop=(${container_start_stop[@]})"  | sudo tee  --append $CONFI
-echo "loglocation=\"$loglocation\"" | sudo tee  --append $CONFI
-echo "logname=\"$logname\"" | sudo tee  --append $CONFI
-
-}
-
-######################################
-
-mainfunction (){
-if [ "$startbackup" == "smartplug" ] ; then
-shallicontinue  
-setup 
-smartplugoff
-sleep 5
-smartplugon 
-echo "Writing config file" 
-writeconfig  >/dev/null
-backupserverstatus 
-elif [ "$startbackup" == "ipmi" ] ; then
-shallicontinue 
-setup
-ipmi_on
-echo "Writing config file"
-writeconfig 
-backupserverstatus
-else
-shallicontinue 
-setup
-wakeonlan
-echo "Writing config file"
-writeconfig 
-backupserverstatus
-fi
-}
-
-############################## start process ###################################
-mkdir -p "$loglocation" && touch "$logname"
-mainfunction 2>&1 | tee -a "$logname"
-exit
-
+main 2>&1 | tee -a "$LOG_FILE"
