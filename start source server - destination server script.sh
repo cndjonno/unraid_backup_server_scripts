@@ -1,255 +1,236 @@
 #!/bin/bash
-# start source server script -- needs source server script and destination server script to work  
-umask 0000
+# Description: Starts Source Server, Syncs Data BACK to Source, and Shuts Down Backup Server.
+# Author: cndjonno (Refactored by Gemini)
+
+# Set secure permissions for created files
+umask 0022
+
 ############# variables ##############################################
-CONFI="/mnt/user/appdata/backupserver/config.cfg" # dont change
-############# other variables set in source server script  ###########
+CONFI="/mnt/user/appdata/backupserver/config.cfg"
+LOCK_FILE="/mnt/user/appdata/backupserver/i_shutdown_source_server"
 
+############# functions ##############################
 
-############################# functions ##############################
+readconfig() { 
+    if [ ! -f "$CONFI" ]; then
+        echo "ERROR: Config file not found at $CONFI"
+        exit 1
+    fi
+    source "$CONFI"
+    
+    # Validate critical variables
+    if [ -z "$source_server_ip" ]; then
+        echo "ERROR: source_server_ip is not set in config."
+        exit 1
+    fi
 
-readconfig () { 
-source "$CONFI"
-HOST="root@""$source_server_ip" 
-mkdir -p "$loglocation"
-logname="$loglocation""$(date +'%Y-%m-%d--%H:%M')""--destination_to_source.txt"
-touch "$logname"
+    HOST="root@$source_server_ip" 
+    mkdir -p "$loglocation"
+    logname="${loglocation}$(date +'%Y-%m-%d--%H:%M')--destination_to_source.txt"
+    touch "$logname"
 }
 
-############################
-
-shallicontinue () {
-if [ -f /mnt/user/appdata/backupserver/i_shutdown_source_server ] ; then
-rm /mnt/user/appdata/backupserver/i_shutdown_source_server
-  checksourceserver
-
-  if [ "$sourceserverstatus" == "on"  ] ; then
-    echo "Source server already running."
-    echo "Shutting down backup server"
-    #poweroff
-    exit
-  else
-    echo "Source server is off...continuing"
-    echo "Attempting to start source server"
-  fi
-
-else
-echo "I didnt shutdown the source server so i will not start it up ....exiting"
-exit
-fi
+check_connection() {
+    # Check if we can actually SSH to the host before trying to run commands
+    ssh -q -o BatchMode=yes -o ConnectTimeout=5 "$HOST" exit
+    if [ $? -ne 0 ]; then
+        echo "ERROR: Cannot SSH to $HOST. Check keys and IP."
+        exit 1
+    fi
 }
 
-############################
+shallicontinue() {
+    if [ -f "$LOCK_FILE" ]; then
+        rm "$LOCK_FILE"
+        checksourceserver
 
-shutdowncontainersbackup() {
-
-for contval in "${container_start_stop[@]}"
-do
-  echo "Shutting down specified containers on backup server before sync ....." 
-  docker stop "$contval"
-  echo 
-done
-sleep 10
+        if [ "$sourceserverstatus" == "on" ]; then
+            echo "Source server is already running."
+            echo "Shutting down backup server..."
+            # poweroff # Uncomment this when fully tested
+            exit 0
+        else
+            echo "Source server is off... attempting to start it."
+        fi
+    else
+        echo "Lock file ($LOCK_FILE) not found. I did not shut down the source, so I will not start it. Exiting."
+        exit 0
+    fi
 }
 
-############################
+# Combined local and remote container management to avoid code duplication
+manage_containers() {
+    local action=$1 # stop or start
+    local location=$2 # local or remote
 
-shutdowncontainerssource() {
-
-for contval in "${container_start_stop[@]}"
-do
-  echo "Shutting down specified containers on source server before sync ....." 
-  ssh "$HOST" docker stop "$contval"
-  echo 
-done
-sleep 10
+    echo "Running docker $action on $location containers..."
+    
+    for contval in "${container_start_stop[@]}"; do
+        if [ "$location" == "remote" ]; then
+            ssh "$HOST" docker "$action" "$contval"
+        else
+            docker "$action" "$contval"
+        fi
+    done
+    sleep 5
 }
 
-############################
+run_rsync_loop() {
+    local type=$1 # 'app' or 'main'
+    
+    for i in {1..9}; do
+        # Dynamically construct variable names
+        if [ "$type" == "app" ]; then
+            local src_var="appdestination$i" # Local path (Backup)
+            local dest_var="appsource$i"     # Remote path (Source)
+        else
+            local src_var="destination$i"    # Local path (Backup)
+            local dest_var="source$i"        # Remote path (Source)
+        fi
 
-startupcontainerssource() {
+        # Use indirect expansion to get values
+        local src_path="${!src_var}"
+        local dest_path="${!dest_var}"
 
-for contval in "${container_start_stop[@]}"
-do
-   echo "Restarting specified containers on source server now appdata is synced ....." 
-   ssh "$HOST" docker start "$contval"
-   echo 
-done
-
+        # Check if both paths are defined
+        if [ -n "$src_path" ] && [ -n "$dest_path" ]; then
+            echo "Syncing $type #$i: $src_path -> $HOST:$dest_path"
+            
+            # SAFETY CHECK: Ensure local directory exists and is not empty before running --delete
+            if [ -d "$src_path" ]; then
+                # Check if directory is empty
+                if [ -z "$(ls -A "$src_path")" ]; then
+                     echo "WARNING: Local path $src_path is EMPTY. Skipping sync to prevent wiping remote server."
+                else
+                     rsync -avhsP --delete "$src_path" "$HOST":"$dest_path"
+                fi
+            else
+                echo "ERROR: Local path $src_path does not exist. Skipping."
+            fi
+        fi
+    done
 }
 
-############################
-
-syncappdata () {
-if [ "$sync_appdata_both_ways" == "yes"  ] ; then
-echo "Appdata will be synced back to source server"
-shutdowncontainerssource
-# the appdata locations below will be synced (these are defined in basic settings on source server)
-if [ "$appsource1" != "" ] && [ "$appdestination1" != ""  ] ; then
-rsync -avhsP --delete "$appdestination1" "$HOST":"$appsource1"     # first appdata location to sync
-fi
-if [ "$appsource2" != "" ] && [ "$appdestination2" != ""  ] ; then
-rsync -avhsP --delete "$appdestination2" "$HOST":"$appsource2"     # second appdata location to sync
-fi
-if [ "$appsource3" != "" ] && [ "$appdestination3" != ""  ] ; then
-rsync -avhsP --delete "$appdestination3" "$HOST":"$appsource3"   # third appdata location to sync
-fi
-if [ "$appsource4" != "" ] && [ "$appdestination4" != ""  ] ; then
-rsync -avhsP --delete "$appdestination4"  "$HOST":"$appsource4"   # forth appdata location to sync
-fi
-if [ "$appsource5" != "" ] && [ "$appdestination5" != ""  ] ; then
-rsync -avhsP --delete "$appdestination5" "$HOST":"$appsource5"     # fifth appdata location to sync
-fi
-if [ "$appsource6" != "" ] && [ "$appdestinatio62" != ""  ] ; then
-rsync -avhsP --delete "$appdestination6" "$HOST":"$appsource6"     # sixth appdata location to sync
-fi
-if [ "$appsource7" != "" ] && [ "$appdestination7" != ""  ] ; then
-rsync -avhsP --delete "$appdestination7" "$HOST":"$appsource7"   # seventh appdata location to sync
-fi
-if [ "$appsource8" != "" ] && [ "$appdestination8" != ""  ] ; then
-rsync -avhsP --delete "$appdestination8" "$HOST":"$appsource8" # eighth appdata location to sync
-fi
-if [ "$appsource9" != "" ] && [ "$appdestination9" != ""  ] ; then
-rsync -avhsP --delete "$appdestination9" "$HOST":"$appsource9"  # ninth appdata location to sync
-fi
-startupcontainerssource # Restart the shutdown containers on source now appdata has been synced
-fi
+syncappdata() {
+    if [ "$sync_appdata_both_ways" == "yes" ]; then
+        echo "-------------------------------------"
+        echo "Starting Appdata Sync to Source..."
+        manage_containers "stop" "remote"
+        run_rsync_loop "app"
+        manage_containers "start" "remote"
+        echo "-------------------------------------"
+    fi
 }
 
-############################
-
-# sync data from destination server to source server
-syncmaindata () {
-if [ "$sync_maindata_both_ways" == "yes"  ] ; then
-echo "Main data will be synced back to source server"
-
-# the locations below will be synced (these are defined in basic settings on source server)
-if [ "$source1" != "" ] && [ "$destination1" != ""  ] ; then
-rsync -avhsP --delete  "$destination1" "$HOST":"$source1"    # first location to sync
-fi
-if [ "$source2" != "" ] && [ "$destination2" != ""  ] ; then
-rsync -avhsP --delete   "$destination2" "$HOST":"$source2"  # second location to sync
-fi
-if [ "$source3" != "" ] && [ "$destination3" != ""  ] ; then
-rsync -avhsP --delete "$destination3" "$HOST":"$source3"  # third location to sync
-fi
-if [ "$source4" != "" ] && [ "$destination4" != ""  ] ; then
-rsync -avhsP --delete  "$destination4" "$HOST":"$source4" # forth location to sync
-fi
-if [ "$source5" != "" ] && [ "$destination5" != ""  ] ; then
-rsync -avhsP --delete  "$destination5" "$HOST":"$source5"   # fifth location to sync
-fi
-if [ "$source6" != "" ] && [ "$destination6" != ""  ] ; then
-rsync -avhsP --delete  "$destination6" "$HOST":"$source6"   # sixth location to sync
-fi
-if [ "$source7" != "" ] && [ "$destination7" != ""  ] ; then
-rsync -avhsP --delete  "$destination7" "$HOST":"$source7"  # seventh location to sync
-fi
-if [ "$source8" != "" ] && [ "$destination8" != ""  ] ; then
-rsync -avhsP --delete  "$destination8" "$HOST":"$source8" # eighth location to sync
-fi
-if [ "$source9" != "" ] && [ "$destination9" != ""  ] ; then
-rsync -avhsP --delete  "$destination9" "$HOST":"$source9" # ninth location to sync
-fi
-fi
+syncmaindata() {
+    if [ "$sync_maindata_both_ways" == "yes" ]; then
+        echo "-------------------------------------"
+        echo "Starting Main Data Sync to Source..."
+        run_rsync_loop "main"
+        echo "-------------------------------------"
+    fi
 }
 
-############################
-
-checkarraystarted () {
-arraycheck=1
-while ssh "$HOST" [ ! -d "/mnt/user/appdata/backupserver/" ]
-do
-echo "Attempt" "$arraycheck" "waiting for source server array to become available"
-echo "Waiting 10 seconds to retry...."
-((arraycheck=arraycheck+1))
-sleep 10
-done
-echo "Attempt" "$arraycheck" "Ok. Source server array now started...."
-echo "I will wait 30 seconds to be sure docker service has started"
-sleep 30
+checkarraystarted() {
+    local max_retries=30
+    local count=0
+    
+    echo "Checking if remote array is online..."
+    # We check if the remote path /mnt/user exists. 
+    # SSH returns 0 if command succeeds (dir exists), 1 if fails.
+    while ! ssh "$HOST" "[ -d /mnt/user/appdata/ ]"; do
+        if [ "$count" -ge "$max_retries" ]; then
+            echo "Timeout waiting for remote array. Exiting."
+            exit 1
+        fi
+        echo "Waiting for source server array... (Attempt $count/$max_retries)"
+        sleep 10
+        ((count++))
+    done
+    
+    echo "Source server array is started."
+    echo "Waiting 30 seconds for Docker service stabilization..."
+    sleep 30
 }
 
-############################
-
-checksourceserver () {
-ping "$source_server_ip" -c3 > /dev/null 2>&1 ; yes=$? ; #ping source server 3 times to check for reply
-  if [ ! $yes == 0 ] ;then
-  sourceserverstatus="off"
-  else
-  sourceserverstatus="on"
-
-fi
+checksourceserver() {
+    if ping -c 1 -W 2 "$source_server_ip" > /dev/null 2>&1; then
+        sourceserverstatus="on"
+    else
+        sourceserverstatus="off"
+    fi
 }
 
-############################
-
-sourceserverstatus () {
-sourcecheck=1
-#check if source server has started up yet
-while [ "$sourceserverstatus" == "off" ]
-do
-  checksourceserver
-  echo "..........Checking source server attempt..." "$sourcecheck"
-  echo "Source server not started yet"
-  echo "Waiting 30 seconds to retry ......"
-  ((sourcecheck=sourcecheck+1))
-  sleep 30  # wait 30 seconds before rechecking
-done
-echo "..........Checking source server attempt..." "$sourcecheck"
-echo "Source server is now up"
+wait_for_source_boot() {
+    local max_retries=20
+    local count=0
+    
+    while [ "$sourceserverstatus" == "off" ]; do
+        if [ "$count" -ge "$max_retries" ]; then
+            echo "Source server failed to boot after significant wait. Exiting."
+            exit 1
+        fi
+        
+        checksourceserver
+        if [ "$sourceserverstatus" == "off" ]; then
+            echo "Source server not up yet. Waiting 30s... (Attempt $count/$max_retries)"
+            sleep 30
+            ((count++))
+        fi
+    done
+    echo "Source server is ONLINE."
 }
 
-############################
-
-wakeonlan () {
-  if [ "$startsource" == "etherwake" ] ; then
-etherwake -b "$backupmacaddress"
-fi
-}
-
-############################
-
-smartplugoff () {
-if [ "$startsource" == "smartplug" ] ; then
-curl "$source_smartplug_ip"/cm?cmnd=Power%20off  > /dev/null 2>&1 #turn off power by smart plug
-fi
-}
-
-############################
-
-smartplugon () {
-if [ "$startsource" == "smartplug" ] ; then
-curl "$source_smartplug_ip"/cm?cmnd=Power%20On  > /dev/null 2>&1 #turn on power and start server
-fi
-}
-
-#################
-
-ipmi_on () {
-if [ "$startsource" == "ipmi" ] ; then
-ipmitool -I lan -H "$source_server_ip" -U "$source_ipmiadminuser" -P "$source_ipmiadminpassword" chassis power on
-fi
-}
-
-################# 
-sync2source () {
-syncmaindata
-syncappdata 
+# Power Management Functions
+wakeonlan_cmd() { [ "$startsource" == "etherwake" ] && etherwake -b "$backupmacaddress"; }
+smartplugoff() { [ "$startsource" == "smartplug" ] && curl -s "$source_smartplug_ip/cm?cmnd=Power%20off" > /dev/null; }
+smartplugon() { [ "$startsource" == "smartplug" ] && curl -s "$source_smartplug_ip/cm?cmnd=Power%20On" > /dev/null; }
+ipmi_on() { 
+    if [ "$startsource" == "ipmi" ]; then
+        ipmitool -I lan -H "$source_server_ip" -U "$source_ipmiadminuser" -P "$source_ipmiadminpassword" chassis power on
+    fi
 }
 
 ################# start process ################################################
+
+# Trap interrupts to ensure we don't leave mess behind
+trap "echo 'Script interrupted'; exit" INT TERM
+
 readconfig
+
+# Start logging everything to file AND console
+exec > >(tee -a "$logname") 2>&1
+
 shallicontinue
-wakeonlan
+
+# Shutdown local containers to free up resources/prevent conflicts
+manage_containers "stop" "local"
+
+# Start Source Server
+wakeonlan_cmd
 ipmi_on
 smartplugoff
 sleep 5
 smartplugon
-sourceserverstatus 
+
+wait_for_source_boot
+check_connection # Verify SSH works before proceeding
 checkarraystarted 
-sync2source 2>&1 | tee -a "$logname"
-rsync -avhsP  "$logname" "$HOST":"$logname" >/dev/null
+
+# Perform Syncs
+syncmaindata
+syncappdata 
+
+# Restart local containers (Optional, but good practice if poweroff fails)
+manage_containers "start" "local"
+
+# Send Log to remote
+echo "Sync complete. Uploading log."
+rsync -avhsP "$logname" "$HOST":"$logname" >/dev/null
+
+# Clean up local log
 rm "$logname"
-poweroff # shutdown server
-exit
+
+echo "Operation successful. Shutting down."
+poweroff
+exit 0
